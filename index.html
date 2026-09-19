@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IPEI Leads Dashboard</title>
+<style>
+  html, body, #root { margin: 0; padding: 0; height: 100%; background: #14171C; overflow: hidden; }
+  #boot-error {
+    display: none;
+    font-family: monospace;
+    color: #ff6b6b;
+    background: #1a1a1a;
+    padding: 20px;
+    white-space: pre-wrap;
+    font-size: 13px;
+    line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<div id="boot-error"></div>
+
+<script>
+  window.addEventListener("error", function (e) {
+    var box = document.getElementById("boot-error");
+    box.style.display = "block";
+    box.textContent = "Page failed to load:\n\n" + (e.error ? (e.error.stack || e.error.message) : e.message);
+  });
+</script>
+
+<script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useEffect, useRef } = React;
+
+// ---- Supabase config ----
+const SUPABASE_URL = "https://hpcujmxctvmwqkjyvtix.supabase.co";
+const SUPABASE_KEY = "sb_publishable_EaEZnMxM2ZF41h3-UTOa8w_XE0naOKD";
+const MESSAGES_TABLE = "all_leads_messages"; // single shared table, filtered by program_group
+
+// ---- Program groups (sections) ----
+const GROUPS = [
+  { id: "Reliability & Quality", label: "Reliability & Quality" },
+  { id: "Industrial Automation", label: "Industrial Automation" },
+  { id: "ETAP Family", label: "ETAP Family" },
+  { id: "Power Equipment", label: "Power Equipment" },
+  { id: "Power Systems Software", label: "Power Systems Software" },
+  { id: "Primavera", label: "Primavera" },
+  { id: "Cyber Security", label: "Cyber Security" },
+];
+
+async function fetchMessages() {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${MESSAGES_TABLE}?select=*&order=created_at.asc`, {
+    headers: {
+      apikey: SUPABASE_KEY,
+      Authorization: `Bearer ${SUPABASE_KEY}`,
+    },
+  });
+  if (!res.ok) throw new Error("Failed to fetch messages: " + res.status);
+  return res.json();
+}
+
+function buildLeadsFromMessages(rows) {
+  const byPhone = {};
+  for (const row of rows) {
+    if (!row.phone) continue;
+    const key = row.phone + "::" + (row.program_group || "Unassigned");
+    if (!byPhone[key]) {
+      byPhone[key] = {
+        id: key,
+        phone: row.phone,
+        name: row.phone,
+        group: row.program_group || "Unassigned",
+        currentStep: "New Lead",
+        program: row.program_group || "",
+        messages: [],
+        unread: 0,
+      };
+    }
+    if (row.message) {
+      const from = row.sender === "lead" ? "lead" : row.sender === "agent" ? "agent" : "bot";
+      byPhone[key].messages.push({
+        from,
+        text: row.message,
+        time: new Date(row.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        rawTime: row.created_at,
+      });
+    }
+  }
+  const leads = Object.values(byPhone);
+  leads.forEach((l) => {
+    const last = l.messages[l.messages.length - 1];
+    l.lastMessage = last ? last.text : "";
+    l.lastActivity = last ? timeAgo(last.rawTime) : "";
+    l.currentStep = last && last.from === "lead" ? "Awaiting Reply" : "New Lead";
+  });
+  leads.sort((a, b) => {
+    const at = a.messages[a.messages.length - 1]?.rawTime || "";
+    const bt = b.messages[b.messages.length - 1]?.rawTime || "";
+    return bt.localeCompare(at);
+  });
+  return leads;
+}
+
+function timeAgo(iso) {
+  if (!iso) return "";
+  const diffMs = Date.now() - new Date(iso).getTime();
+  const mins = Math.floor(diffMs / 60000);
+  if (mins < 1) return "Just now";
+  if (mins < 60) return `${mins} min ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs} hr ago`;
+  const days = Math.floor(hrs / 24);
+  return `${days}d ago`;
+}
+
+const COLORS = {
+  bg: "#14171C",
+  surface: "#1B1F26",
+  surfaceRaised: "#20252D",
+  border: "#2A3038",
+  borderLit: "#3A4250",
+  text: "#E8EAED",
+  textMuted: "#8B94A3",
+  textFaint: "#5B6472",
+  amber: "#F0A83C",
+  blue: "#4FA8D8",
+  green: "#4CAF7D",
+  red: "#E1615B",
+};
+
+function StatusDot({ color, pulse }) {
+  return (
+    <span
+      style={{
+        display: "inline-block",
+        width: 7,
+        height: 7,
+        borderRadius: "50%",
+        background: color,
+        boxShadow: pulse ? `0 0 0 3px ${color}22` : "none",
+        flexShrink: 0,
+      }}
+    />
+  );
+}
+
+function IPEILeadsDashboard() {
+  const [allLeads, setAllLeads] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [activeGroup, setActiveGroup] = useState(GROUPS[0].id);
+  const [selectedId, setSelectedId] = useState(null);
+  const [search, setSearch] = useState("");
+  const chatScrollRef = useRef(null);
+
+  const loadLeads = async () => {
+    try {
+      const rows = await fetchMessages();
+      setAllLeads(buildLeadsFromMessages(rows));
+      setError(null);
+    } catch (e) {
+      setError(e.message || "Could not load data");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadLeads();
+    const poll = setInterval(loadLeads, 15000);
+    return () => clearInterval(poll);
+  }, []);
+
+  const groupCounts = useMemo(() => {
+    const counts = {};
+    GROUPS.forEach((g) => (counts[g.id] = 0));
+    allLeads.forEach((l) => {
+      if (counts[l.group] !== undefined) counts[l.group] += 1;
+    });
+    return counts;
+  }, [allLeads]);
+
+  const groupLeads = useMemo(
+    () => allLeads.filter((l) => l.group === activeGroup),
+    [allLeads, activeGroup]
+  );
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return groupLeads;
+    return groupLeads.filter(
+      (l) => l.name.toLowerCase().includes(q) || l.phone.toLowerCase().includes(q)
+    );
+  }, [groupLeads, search]);
+
+  useEffect(() => {
+    if (filtered.length > 0 && !filtered.find((l) => l.id === selectedId)) {
+      setSelectedId(filtered[0].id);
+    } else if (filtered.length === 0) {
+      setSelectedId(null);
+    }
+  }, [filtered, selectedId]);
+
+  const selected = filtered.find((l) => l.id === selectedId);
+
+  useEffect(() => {
+    if (chatScrollRef.current) {
+      chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
+    }
+  }, [selectedId, selected?.messages?.length]);
+
+  const totalToday = allLeads.filter(
+    (l) => l.lastActivity.includes("min") || l.lastActivity.includes("hr")
+  ).length;
+
+  return (
+    <div
+      style={{
+        fontFamily: "'Inter', sans-serif",
+        background: COLORS.bg,
+        color: COLORS.text,
+        height: "100vh",
+        overflow: "hidden",
+        display: "flex",
+        flexDirection: "column",
+        fontSize: 14,
+      }}
+    >
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=IBM+Plex+Sans:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+        * { box-sizing: border-box; }
+        ::selection { background: ${COLORS.blue}44; }
+        .scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }
+        .scrollbar::-webkit-scrollbar-thumb { background: ${COLORS.borderLit}; border-radius: 3px; }
+        .scrollbar::-webkit-scrollbar-track { background: transparent; }
+        button { font-family: inherit; cursor: pointer; }
+        input { font-family: inherit; }
+        .row-hover:hover { background: ${COLORS.surfaceRaised} !important; }
+        .bubble-in { animation: fadeIn 0.15s ease; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+        @media (max-width: 900px) {
+          .list-panel { width: 240px !important; }
+        }
+        @media (max-width: 680px) {
+          .list-panel { display: none !important; }
+        }
+      `}</style>
+
+      {/* Top bar */}
+      <div
+        style={{
+          borderBottom: `1px solid ${COLORS.border}`,
+          padding: "14px 24px",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          background: COLORS.surface,
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div
+            style={{
+              width: 32,
+              height: 32,
+              borderRadius: 6,
+              background: COLORS.bg,
+              border: `1px solid ${COLORS.borderLit}`,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              color: COLORS.amber,
+              fontFamily: "'IBM Plex Mono', monospace",
+              fontWeight: 500,
+              fontSize: 13,
+            }}
+          >
+            IP
+          </div>
+          <div>
+            <div style={{ fontFamily: "'IBM Plex Sans', sans-serif", fontWeight: 600, fontSize: 15 }}>
+              IPEI Leads Dashboard
+            </div>
+            <div style={{ fontSize: 11, color: COLORS.textFaint, fontFamily: "'IBM Plex Mono', monospace" }}>
+              All Programs · WhatsApp Admissions
+            </div>
+          </div>
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 28 }}>
+          <Readout label="Total Leads" value={allLeads.length} />
+          <Readout label="Active Today" value={totalToday} color={COLORS.blue} />
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <StatusDot color={error ? COLORS.red : loading ? COLORS.textFaint : COLORS.green} pulse={!error && !loading} />
+            <span style={{ fontSize: 11, fontFamily: "'IBM Plex Mono', monospace", color: COLORS.textFaint }}>
+              {error ? "Offline" : loading ? "Syncing..." : "Live"}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      {error && (
+        <div
+          style={{
+            background: "#3A1A18",
+            borderBottom: `1px solid ${COLORS.red}55`,
+            color: "#F0A8A3",
+            fontSize: 12.5,
+            padding: "8px 24px",
+            fontFamily: "'IBM Plex Mono', monospace",
+          }}
+        >
+          Couldn't reach Supabase — {error}
+        </div>
+      )}
+
+      {/* Group tabs */}
+      <div
+        className="scrollbar"
+        style={{
+          display: "flex",
+          gap: 4,
+          padding: "10px 20px",
+          borderBottom: `1px solid ${COLORS.border}`,
+          background: COLORS.surface,
+          overflowX: "auto",
+        }}
+      >
+        {GROUPS.map((g) => {
+          const active = g.id === activeGroup;
+          return (
+            <button
+              key={g.id}
+              onClick={() => setActiveGroup(g.id)}
+              style={{
+                flexShrink: 0,
+                padding: "7px 14px",
+                borderRadius: 6,
+                border: `1px solid ${active ? COLORS.amber : COLORS.border}`,
+                background: active ? COLORS.amber + "18" : "transparent",
+                color: active ? COLORS.amber : COLORS.textMuted,
+                fontSize: 12.5,
+                fontWeight: active ? 600 : 500,
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+              }}
+            >
+              {g.label}
+              <span
+                style={{
+                  fontFamily: "'IBM Plex Mono', monospace",
+                  fontSize: 10.5,
+                  color: active ? COLORS.amber : COLORS.textFaint,
+                }}
+              >
+                {groupCounts[g.id] || 0}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+
+      <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
+        {/* Lead list */}
+        <div
+          className="list-panel"
+          style={{
+            width: 300,
+            flexShrink: 0,
+            display: "flex",
+            flexDirection: "column",
+            minHeight: 0,
+            borderRight: `1px solid ${COLORS.border}`,
+          }}
+        >
+          <div style={{ padding: "12px 16px", borderBottom: `1px solid ${COLORS.border}` }}>
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search name or phone..."
+              style={{
+                width: "100%",
+                background: COLORS.surfaceRaised,
+                border: `1px solid ${COLORS.border}`,
+                borderRadius: 6,
+                padding: "8px 12px",
+                color: COLORS.text,
+                fontSize: 13,
+                outline: "none",
+              }}
+            />
+          </div>
+          <div className="scrollbar" style={{ overflowY: "auto", flex: 1 }}>
+            {loading && allLeads.length === 0 && (
+              <div style={{ padding: 32, textAlign: "center", color: COLORS.textFaint, fontSize: 13 }}>
+                Loading conversations...
+              </div>
+            )}
+            {!loading && filtered.length === 0 && (
+              <div style={{ padding: 32, textAlign: "center", color: COLORS.textFaint, fontSize: 13 }}>
+                No leads in this section yet.
+              </div>
+            )}
+            {filtered.map((l) => {
+              const isSelected = selected && l.id === selected.id;
+              return (
+                <div
+                  key={l.id}
+                  className="row-hover"
+                  onClick={() => setSelectedId(l.id)}
+                  style={{
+                    padding: "13px 16px",
+                    borderBottom: `1px solid ${COLORS.border}`,
+                    cursor: "pointer",
+                    background: isSelected ? COLORS.surfaceRaised : "transparent",
+                    borderLeft: isSelected ? `2px solid ${COLORS.amber}` : "2px solid transparent",
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                      <StatusDot
+                        color={l.currentStep === "Awaiting Reply" ? COLORS.textFaint : COLORS.blue}
+                        pulse={l.currentStep !== "Awaiting Reply"}
+                      />
+                      <span style={{ fontWeight: 600, fontSize: 13.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                        {l.name}
+                      </span>
+                    </div>
+                    <span style={{ fontSize: 10.5, color: COLORS.textFaint, fontFamily: "'IBM Plex Mono', monospace", flexShrink: 0 }}>
+                      {l.lastActivity}
+                    </span>
+                  </div>
+                  <div
+                    style={{
+                      fontSize: 12,
+                      color: COLORS.textMuted,
+                      whiteSpace: "nowrap",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                    }}
+                  >
+                    {l.lastMessage}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Chat thread */}
+        <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0, minHeight: 0, background: COLORS.bg }}>
+          {selected ? (
+            <>
+              <div
+                style={{
+                  padding: "12px 18px",
+                  borderBottom: `1px solid ${COLORS.border}`,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  background: COLORS.surface,
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <StatusDot color={COLORS.blue} />
+                  <div>
+                    <div style={{ fontWeight: 600, fontSize: 14 }}>{selected.name}</div>
+                    <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: COLORS.textFaint }}>
+                      {selected.phone} · {selected.group}
+                    </div>
+                  </div>
+                </div>
+                <a
+                  href={`https://wa.me/${selected.phone}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  style={{
+                    padding: "7px 12px",
+                    borderRadius: 6,
+                    border: "none",
+                    background: COLORS.amber,
+                    color: "#1A1400",
+                    fontSize: 12,
+                    fontWeight: 700,
+                    textDecoration: "none",
+                  }}
+                >
+                  Open on WhatsApp
+                </a>
+              </div>
+
+              <div ref={chatScrollRef} className="scrollbar" style={{ flex: 1, overflowY: "auto", padding: "18px 20px", display: "flex", flexDirection: "column", gap: 3 }}>
+                {selected.messages.map((m, i) => (
+                  <ChatBubble key={i} msg={m} />
+                ))}
+                {selected.messages.length === 0 && (
+                  <div style={{ color: COLORS.textFaint, fontSize: 13, textAlign: "center", marginTop: 40 }}>
+                    No messages yet.
+                  </div>
+                )}
+              </div>
+
+              <div
+                style={{
+                  padding: "10px 16px",
+                  borderTop: `1px solid ${COLORS.border}`,
+                  background: COLORS.surface,
+                  fontSize: 11.5,
+                  color: COLORS.textFaint,
+                  fontFamily: "'IBM Plex Mono', monospace",
+                  textAlign: "center",
+                }}
+              >
+                Read-only view — replies are sent automatically by the WhatsApp bot
+              </div>
+            </>
+          ) : (
+            <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: COLORS.textFaint, fontSize: 13 }}>
+              Select a lead to view conversation.
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ChatBubble({ msg }) {
+  const isLead = msg.from === "lead";
+  const isBot = msg.from === "bot";
+  return (
+    <div className="bubble-in" style={{ display: "flex", justifyContent: isLead ? "flex-start" : "flex-end", marginBottom: 6 }}>
+      <div
+        style={{
+          maxWidth: "72%",
+          background: isLead ? COLORS.surfaceRaised : isBot ? "#1E3A4A" : "#2E4430",
+          border: `1px solid ${isLead ? COLORS.border : isBot ? "#2E5468" : "#3D5C3A"}`,
+          borderRadius: 10,
+          padding: "8px 12px",
+          fontSize: 13.5,
+          lineHeight: 1.5,
+        }}
+      >
+        {!isLead && (
+          <div style={{ fontSize: 10, color: isBot ? COLORS.blue : COLORS.green, fontWeight: 700, marginBottom: 2, letterSpacing: "0.03em" }}>
+            {isBot ? "IPEI BOT" : "AGENT"}
+          </div>
+        )}
+        <div>{msg.text}</div>
+        <div style={{ fontSize: 10, color: COLORS.textFaint, marginTop: 4, textAlign: "right", fontFamily: "'IBM Plex Mono', monospace" }}>
+          {msg.time}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Readout({ label, value, color }) {
+  return (
+    <div style={{ textAlign: "right" }}>
+      <div style={{ fontSize: 10, letterSpacing: "0.06em", textTransform: "uppercase", color: COLORS.textFaint }}>
+        {label}
+      </div>
+      <div
+        style={{
+          fontFamily: "'IBM Plex Mono', monospace",
+          fontSize: 17,
+          fontWeight: 500,
+          color: color || COLORS.text,
+        }}
+      >
+        {value}
+      </div>
+    </div>
+  );
+}
+
+try {
+  const root = ReactDOM.createRoot(document.getElementById("root"));
+  root.render(<IPEILeadsDashboard />);
+} catch (e) {
+  var box = document.getElementById("boot-error");
+  box.style.display = "block";
+  box.textContent = "Render failed:\n\n" + e.stack;
+}
+</script>
+</body>
+</html>
